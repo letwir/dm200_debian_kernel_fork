@@ -1,637 +1,529 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Rockchip Specific Extensions for Synopsys DW Multimedia Card Interface driver
- *
- * Copyright (C) 2014, Rockchip Electronics Co., Ltd.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * Copyright (c) 2014, Fuzhou Rockchip Electronics Co., Ltd
  */
 
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/clk.h>
 #include <linux/mmc/host.h>
-#include <linux/mmc/mmc.h>
-#include <linux/mmc/rk_mmc.h>
-#include <linux/of.h>
-#include <linux/of_gpio.h>
+#include <linux/of_address.h>
+#include <linux/mmc/slot-gpio.h>
+#include <linux/pm_runtime.h>
 #include <linux/slab.h>
-#include <linux/rockchip/cpu.h>
-#include <linux/rockchip/cru.h>
-#include <linux/delay.h>
-#include "rk_sdmmc.h"
+
+#include "dw_mmc.h"
 #include "dw_mmc-pltfm.h"
-#include "../../clk/rockchip/clk-ops.h"
 
-#include "rk_sdmmc_dbg.h"
+#define RK3288_CLKGEN_DIV		2
+#define SDMMC_TIMING_CON0		0x130
+#define SDMMC_TIMING_CON1		0x134
+#define ROCKCHIP_MMC_DELAY_SEL		BIT(10)
+#define ROCKCHIP_MMC_DEGREE_MASK	0x3
+#define ROCKCHIP_MMC_DEGREE_OFFSET	1
+#define ROCKCHIP_MMC_DELAYNUM_OFFSET	2
+#define ROCKCHIP_MMC_DELAYNUM_MASK	(0xff << ROCKCHIP_MMC_DELAYNUM_OFFSET)
+#define ROCKCHIP_MMC_DELAY_ELEMENT_PSEC	60
+#define HIWORD_UPDATE(val, mask, shift) \
+		((val) << (shift) | (mask) << ((shift) + 16))
 
-/*CRU SDMMC TUNING*/
-/*
-*   sdmmc,sdio0,sdio1,emmc id=0~3
-*   cclk_in_drv, cclk_in_sample  i=0,1
-*/
+static const unsigned int freqs[] = { 100000, 200000, 300000, 400000 };
 
-static  u32 cru_tuning_base = 0;
-
-#define CRU_SDMMC_CON(id, tuning_type)	(cru_tuning_base + ((id) * 8) + ((tuning_type) * 4))
-
-#define MAX_DELAY_LINE  (0xff)
-#define FREQ_REF_150MHZ (150000000)
-#define PRECISE_ADJUST  (0)
-
-#define SDMMC_TUNING_SEL(tuning_type)           ( tuning_type? 10:11 )
-#define SDMMC_TUNING_DELAYNUM(tuning_type)      ( tuning_type? 2:3 )
-#define SDMMC_TUNING_DEGREE(tuning_type)        ( tuning_type? 0:1 )
-#define SDMMC_TUNING_INIT_STATE                 (0)
-
-enum{
-       SDMMC_SHIFT_DEGREE_0 = 0,
-       SDMMC_SHIFT_DEGREE_90,
-       SDMMC_SHIFT_DEGREE_180,
-       SDMMC_SHIFT_DEGREE_270,
-       SDMMC_SHIFT_DEGREE_INVALID,
-};
-
-const char *phase_desc[SDMMC_SHIFT_DEGREE_INVALID + 1] = {
-        "SDMMC_SHIFT_DEGREE_0",
-        "SDMMC_SHIFT_DEGREE_90",
-        "SDMMC_SHIFT_DEGREE_180",
-        "SDMMC_SHIFT_DEGREE_270",
-        "SDMMC_SHIFT_DEGREE_INVALID",
-};
-
-enum{
-        USE_CLK_AFTER_PHASE = 0,
-        USE_CLK_AFTER_PHASE_AND_DELAY_LINE = 1,
-};
-
-enum{
-        IO_DRV_2MA  = 0x0,
-        IO_DRV_4MA  = 0x1,
-        IO_DRV_8MA  = 0x2,
-        IO_DRV_12MA = 0x3,
-};
-
-enum{
-        SLEW_RATE_SLOW = 0,
-        SLEW_RATE_FAST = 1,
-};
-
-/* Variations in Rockchip specific dw-mshc controller */
-enum dw_mci_rockchip_type {
-	DW_MCI_TYPE_RK3188,
-	DW_MCI_TYPE_RK3288,
-	DW_MCI_TYPE_RK3036,
-	DW_MCI_TYPE_RK312X,
-};
-
-/* Rockchip implementation specific driver private data */
 struct dw_mci_rockchip_priv_data {
-	enum dw_mci_rockchip_type		ctrl_type;
-	u8				ciu_div;
-	u32				sdr_timing;
-	u32				ddr_timing;
-	u32				cur_speed;
+	struct clk		*drv_clk;
+	struct clk		*sample_clk;
+	int			default_sample_phase;
+	int			num_phases;
+	bool			internal_phase;
 };
 
-static struct dw_mci_rockchip_compatible {
-	char				*compatible;
-	enum dw_mci_rockchip_type		ctrl_type;
-} rockchip_compat[] = {
-	{
-		.compatible	= "rockchip,rk31xx-sdmmc",
-		.ctrl_type	= DW_MCI_TYPE_RK3188,
-	},{
-		.compatible	= "rockchip,rk32xx-sdmmc",
-		.ctrl_type	= DW_MCI_TYPE_RK3288,
-	},{
-		.compatible	= "rockchip,rk3036-sdmmc",
-		.ctrl_type	= DW_MCI_TYPE_RK3036,
-	},{
-		.compatible	= "rockchip,rk312x-sdmmc",
-		.ctrl_type	= DW_MCI_TYPE_RK312X,
-	},
-};
-
-static int dw_mci_rockchip_priv_init(struct dw_mci *host)
+/*
+ * Each fine delay is between 44ps-77ps. Assume each fine delay is 60ps to
+ * simplify calculations. So 45degs could be anywhere between 33deg and 57.8deg.
+ */
+static int rockchip_mmc_get_internal_phase(struct dw_mci *host, bool sample)
 {
-	struct dw_mci_rockchip_priv_data *priv;
-	int idx;
+	unsigned long rate = clk_get_rate(host->ciu_clk);
+	u32 raw_value;
+	u16 degrees;
+	u32 delay_num = 0;
 
-	priv = devm_kzalloc(host->dev, sizeof(*priv), GFP_KERNEL);
-	if(!priv){
-		dev_err(host->dev, "mem alloc failed for private data\n");
-		return -ENOMEM;
+	/* Constant signal, no measurable phase shift */
+	if (!rate)
+		return 0;
+
+	if (sample)
+		raw_value = mci_readl(host, TIMING_CON1);
+	else
+		raw_value = mci_readl(host, TIMING_CON0);
+
+	raw_value >>= ROCKCHIP_MMC_DEGREE_OFFSET;
+	degrees = (raw_value & ROCKCHIP_MMC_DEGREE_MASK) * 90;
+
+	if (raw_value & ROCKCHIP_MMC_DELAY_SEL) {
+		/* degrees/delaynum * 1000000 */
+		unsigned long factor = (ROCKCHIP_MMC_DELAY_ELEMENT_PSEC / 10) *
+					36 * (rate / 10000);
+
+		delay_num = (raw_value & ROCKCHIP_MMC_DELAYNUM_MASK);
+		delay_num >>= ROCKCHIP_MMC_DELAYNUM_OFFSET;
+		degrees += DIV_ROUND_CLOSEST(delay_num * factor, 1000000);
 	}
 
-	for(idx = 0; idx < ARRAY_SIZE(rockchip_compat); idx++){
-                if(of_device_is_compatible(host->dev->of_node,
-                                rockchip_compat[idx].compatible))
-			priv->ctrl_type = rockchip_compat[idx].ctrl_type;
-	}
-
-	host->priv = priv;
-	return 0;
+	return degrees % 360;
 }
 
-static int dw_mci_rockchip_setup_clock(struct dw_mci *host)
+static int rockchip_mmc_get_phase(struct dw_mci *host, bool sample)
 {
 	struct dw_mci_rockchip_priv_data *priv = host->priv;
+	struct clk *clock = sample ? priv->sample_clk : priv->drv_clk;
 
-	if ((priv->ctrl_type == DW_MCI_TYPE_RK3288) ||
-                (priv->ctrl_type == DW_MCI_TYPE_RK3036) ||
-                (priv->ctrl_type == DW_MCI_TYPE_RK312X))
-		host->bus_hz /= (priv->ciu_div + 1);
+	if (priv->internal_phase)
+		return rockchip_mmc_get_internal_phase(host, sample);
+	else
+		return clk_get_phase(clock);
+}
+
+static int rockchip_mmc_set_internal_phase(struct dw_mci *host, bool sample, int degrees)
+{
+	unsigned long rate = clk_get_rate(host->ciu_clk);
+	u8 nineties, remainder;
+	u8 delay_num;
+	u32 raw_value;
+	u32 delay;
+
+	/*
+	 * The below calculation is based on the output clock from
+	 * MMC host to the card, which expects the phase clock inherits
+	 * the clock rate from its parent, namely the output clock
+	 * provider of MMC host. However, things may go wrong if
+	 * (1) It is orphan.
+	 * (2) It is assigned to the wrong parent.
+	 *
+	 * This check help debug the case (1), which seems to be the
+	 * most likely problem we often face and which makes it difficult
+	 * for people to debug unstable mmc tuning results.
+	 */
+	if (!rate) {
+		dev_err(host->dev, "%s: invalid clk rate\n", __func__);
+		return -EINVAL;
+	}
+
+	nineties = degrees / 90;
+	remainder = (degrees % 90);
+
+	/*
+	 * Due to the inexact nature of the "fine" delay, we might
+	 * actually go non-monotonic.  We don't go _too_ monotonic
+	 * though, so we should be OK.  Here are options of how we may
+	 * work:
+	 *
+	 * Ideally we end up with:
+	 *   1.0, 2.0, ..., 69.0, 70.0, ...,  89.0, 90.0
+	 *
+	 * On one extreme (if delay is actually 44ps):
+	 *   .73, 1.5, ..., 50.6, 51.3, ...,  65.3, 90.0
+	 * The other (if delay is actually 77ps):
+	 *   1.3, 2.6, ..., 88.6. 89.8, ..., 114.0, 90
+	 *
+	 * It's possible we might make a delay that is up to 25
+	 * degrees off from what we think we're making.  That's OK
+	 * though because we should be REALLY far from any bad range.
+	 */
+
+	/*
+	 * Convert to delay; do a little extra work to make sure we
+	 * don't overflow 32-bit / 64-bit numbers.
+	 */
+	delay = 10000000; /* PSECS_PER_SEC / 10000 / 10 */
+	delay *= remainder;
+	delay = DIV_ROUND_CLOSEST(delay,
+			(rate / 1000) * 36 *
+				(ROCKCHIP_MMC_DELAY_ELEMENT_PSEC / 10));
+
+	delay_num = (u8) min_t(u32, delay, 255);
+
+	raw_value = delay_num ? ROCKCHIP_MMC_DELAY_SEL : 0;
+	raw_value |= delay_num << ROCKCHIP_MMC_DELAYNUM_OFFSET;
+	raw_value |= nineties;
+
+	if (sample)
+		mci_writel(host, TIMING_CON1, HIWORD_UPDATE(raw_value, 0x07ff, 1));
+	else
+		mci_writel(host, TIMING_CON0, HIWORD_UPDATE(raw_value, 0x07ff, 1));
+
+	dev_dbg(host->dev, "set %s_phase(%d) delay_nums=%u actual_degrees=%d\n",
+		sample ? "sample" : "drv", degrees, delay_num,
+		rockchip_mmc_get_phase(host, sample)
+	);
 
 	return 0;
 }
 
-static void dw_mci_rockchip_prepare_command(struct dw_mci *host, u32 *cmdr)
+static int rockchip_mmc_set_phase(struct dw_mci *host, bool sample, int degrees)
 {
+	struct dw_mci_rockchip_priv_data *priv = host->priv;
+	struct clk *clock = sample ? priv->sample_clk : priv->drv_clk;
 
+	if (priv->internal_phase)
+		return rockchip_mmc_set_internal_phase(host, sample, degrees);
+	else
+		return clk_set_phase(clock, degrees);
 }
 
-static void dw_mci_rockchip_set_ios(struct dw_mci *host, struct mmc_ios *ios)
+static void dw_mci_rk3288_set_ios(struct dw_mci *host, struct mmc_ios *ios)
 {
+	struct dw_mci_rockchip_priv_data *priv = host->priv;
+	int ret;
+	unsigned int cclkin;
+	u32 bus_hz;
 
-}
+	if (ios->clock == 0)
+		return;
 
-static int dw_mci_rockchip_parse_dt(struct dw_mci *host)
-{
-        return 0;
-}
-static inline u8 dw_mci_rockchip_get_delaynum(struct dw_mci *host, u8 con_id, u8 tuning_type)
-{
-        u32 regs;
-        u8 delaynum;
+	/*
+	 * cclkin: source clock of mmc controller
+	 * bus_hz: card interface clock generated by CLKGEN
+	 * bus_hz = cclkin / RK3288_CLKGEN_DIV
+	 * ios->clock = (div == 0) ? bus_hz : (bus_hz / (2 * div))
+	 *
+	 * Note: div can only be 0 or 1, but div must be set to 1 for eMMC
+	 * DDR52 8-bit mode.
+	 */
+	if (ios->bus_width == MMC_BUS_WIDTH_8 &&
+	    ios->timing == MMC_TIMING_MMC_DDR52)
+		cclkin = 2 * ios->clock * RK3288_CLKGEN_DIV;
+	else
+		cclkin = ios->clock * RK3288_CLKGEN_DIV;
 
-        regs =  cru_readl(CRU_SDMMC_CON(con_id, tuning_type));
-        delaynum = ((regs>>SDMMC_TUNING_DELAYNUM(tuning_type)) & 0xff);
+	ret = clk_set_rate(host->ciu_clk, cclkin);
+	if (ret)
+		dev_warn(host->dev, "failed to set rate %uHz err: %d\n", cclkin, ret);
 
-        return delaynum;
-}
-
-static inline void dw_mci_rockchip_set_delaynum(struct dw_mci *host, u8 con_id, u8 tuning_type, u8 delaynum)
-{
-        u32 regs;
-        regs = cru_readl(CRU_SDMMC_CON(con_id, tuning_type));
-        regs &= ~( 0xff << SDMMC_TUNING_DELAYNUM(tuning_type));
-        regs |= (delaynum  << SDMMC_TUNING_DELAYNUM(tuning_type));
-        regs |= (0xff  << (SDMMC_TUNING_DELAYNUM(tuning_type)+16));
-
-        MMC_DBG_INFO_FUNC(host->mmc,"tuning_result[delayline]: con_id = %d, tuning_type = %d, CRU_CON = 0x%x. [%s]",
-                con_id, tuning_type, regs, mmc_hostname(host->mmc));
-
-        cru_writel(regs, CRU_SDMMC_CON(con_id, tuning_type));
-}
-
-static inline void dw_mci_rockchip_set_degree(struct dw_mci *host, u8 con_id, u8 tuning_type, u8 phase)
-{
-        u32 regs;
-        
-	regs = cru_readl(CRU_SDMMC_CON(con_id, tuning_type));
-	regs &= ~( 0x3 << SDMMC_TUNING_DEGREE(tuning_type));
-	regs |= (phase  << SDMMC_TUNING_DEGREE(tuning_type));
-	regs |= (0x3  << (SDMMC_TUNING_DEGREE(tuning_type)+16));
-
-        MMC_DBG_INFO_FUNC(host->mmc,"tuning_result[phase]: con_id = %d, tuning_type= %d, CRU_CON = 0x%x. [%s]",
-                con_id, tuning_type, regs, mmc_hostname(host->mmc));
-	
-	cru_writel(regs, CRU_SDMMC_CON(con_id, tuning_type));
-}
-
-static inline void dw_mci_rockchip_turning_sel(struct dw_mci *host, u8 con_id, u8 tuning_type, u8 mode)
-{
-        u32 regs;
-	regs = cru_readl(CRU_SDMMC_CON(con_id, tuning_type)) ;
-	regs &= ~( 0x1 << SDMMC_TUNING_SEL(tuning_type));
-	regs |= (mode  << SDMMC_TUNING_SEL(tuning_type));
-	regs |= (0x1  << (SDMMC_TUNING_SEL(tuning_type)+16));
-
-	MMC_DBG_INFO_FUNC(host->mmc,"tuning_sel: con_id = %d, tuning_type = %d, CRU_CON = 0x%x. [%s]",
-                con_id, tuning_type, regs, mmc_hostname(host->mmc));
-                
-	cru_writel(regs, CRU_SDMMC_CON(con_id, tuning_type));       
-}
-
-
-static inline u8 dw_mci_rockchip_get_phase(struct dw_mci *host, u8 con_id, u8 tuning_type)
-{
-	return 0;
-}
-
-static inline u8 dw_mci_rockchip_move_next_clksmpl(struct dw_mci *host, u8 con_id, u8 tuning_type, u8 val)
-{
-        u32 regs;
-        
-        regs = cru_readl(CRU_SDMMC_CON(con_id, tuning_type)) ;
-
-	if(tuning_type) {
-	    val = ((regs>>SDMMC_TUNING_DELAYNUM(tuning_type)) & 0xff);
+	bus_hz = clk_get_rate(host->ciu_clk) / RK3288_CLKGEN_DIV;
+	if (bus_hz != host->bus_hz) {
+		host->bus_hz = bus_hz;
+		/* force dw_mci_setup_bus() */
+		host->current_speed = 0;
 	}
 
-	return val;
-}
+	/* Make sure we use phases which we can enumerate with */
+	if (!IS_ERR(priv->sample_clk) && ios->timing <= MMC_TIMING_SD_HS)
+		rockchip_mmc_set_phase(host, true, priv->default_sample_phase);
 
-static void dw_mci_rockchip_load_signal_integrity(struct dw_mci *host, u32 sr, u32 drv)
-{
-        if (unlikely((drv > IO_DRV_12MA) || (sr > SLEW_RATE_FAST))) {
-                MMC_DBG_ERR_FUNC(host->mmc,"wrong signal integrity setting: drv = %d, sr = %d ![%s]",
-                        drv, sr, mmc_hostname(host->mmc));
-                return;
-        }
+	/*
+	 * Set the drive phase offset based on speed mode to achieve hold times.
+	 *
+	 * NOTE: this is _not_ a value that is dynamically tuned and is also
+	 * _not_ a value that will vary from board to board.  It is a value
+	 * that could vary between different SoC models if they had massively
+	 * different output clock delays inside their dw_mmc IP block (delay_o),
+	 * but since it's OK to overshoot a little we don't need to do complex
+	 * calculations and can pick values that will just work for everyone.
+	 *
+	 * When picking values we'll stick with picking 0/90/180/270 since
+	 * those can be made very accurately on all known Rockchip SoCs.
+	 *
+	 * Note that these values match values from the DesignWare Databook
+	 * tables for the most part except for SDR12 and "ID mode".  For those
+	 * two modes the databook calculations assume a clock in of 50MHz.  As
+	 * seen above, we always use a clock in rate that is exactly the
+	 * card's input clock (times RK3288_CLKGEN_DIV, but that gets divided
+	 * back out before the controller sees it).
+	 *
+	 * From measurement of a single device, it appears that delay_o is
+	 * about .5 ns.  Since we try to leave a bit of margin, it's expected
+	 * that numbers here will be fine even with much larger delay_o
+	 * (the 1.4 ns assumed by the DesignWare Databook would result in the
+	 * same results, for instance).
+	 */
+	if (!IS_ERR(priv->drv_clk)) {
+		int phase;
 
-        if(cpu_is_rk3288()){
-                /*Note 00: 2ma 01:4ma 10:8ma 11:12ma
-                For consider line loading and IP's slew rate,
-                we should match these by every board depends for signal integrity.
-                slew rate >= 2*pi*f*Vpeak = max(|d'(Vpeak)/dt|)
-                */
-                if (host->mmc->restrict_caps & RESTRICT_CARD_TYPE_SDIO) {
-                        grf_writel(0xff005500 | (drv << 14) | (drv << 12) |
-                                                 (drv << 10) | (drv << 8), 0x01f8); /* GPIO4C4-C7 */
-                        grf_writel(0x000f0000 | (drv << 0) | (drv << 2), 0x01fc); /* GPIO4D0-D1 */
-                        grf_writel(0x03f00000 | (sr << 4) | (sr << 5) | (sr << 6) |
-                                                (sr << 7) | (sr << 8) | (sr << 9) , 0x011c); /* slew rate*/
-                }else if (host->mmc->restrict_caps & RESTRICT_CARD_TYPE_SD) {
-                        grf_writel(0x3fff0000 | (drv << 0) | (drv << 2) | (drv << 4) |
-                                                 (drv << 6) | (drv << 8) | (drv << 10) |
-                                                 (drv << 12), 0x0218); /* GPIO6C0-C6 */
-                        grf_writel(0x003f0000 | (sr << 0) | (sr << 1) | (sr << 2) |
-                                                (sr << 3) | (sr << 4) | (sr << 5), 0x012c); /* slew rate */
-                }else if (host->mmc->restrict_caps & RESTRICT_CARD_TYPE_EMMC) {
-                        /* emmc hardware relative addr match requirement, assume 4ma not slow slew rate */
-                        grf_writel(0xffff5555, 0x01e0); /* GPIO3A0-A7 */
-                        grf_writel(0x000c0006, 0x01e4); /* GPIO3B1 */
-                        grf_writel(0x003f0015, 0x01e8); /* GPIO3C2-C0 */
-                }
-        }
+		/*
+		 * In almost all cases a 90 degree phase offset will provide
+		 * sufficient hold times across all valid input clock rates
+		 * assuming delay_o is not absurd for a given SoC.  We'll use
+		 * that as a default.
+		 */
+		phase = 90;
 
-}
-static void dw_mci_rockchip_load_tuning_base(void)
-{
-        /* load tuning base */
-        if(cpu_is_rk3288())
-                cru_tuning_base =  RK3288_CRU_SDMMC_CON0;
-}
+		switch (ios->timing) {
+		case MMC_TIMING_MMC_DDR52:
+			/*
+			 * Since clock in rate with MMC_DDR52 is doubled when
+			 * bus width is 8 we need to double the phase offset
+			 * to get the same timings.
+			 */
+			if (ios->bus_width == MMC_BUS_WIDTH_8)
+				phase = 180;
+			break;
+		case MMC_TIMING_UHS_SDR104:
+		case MMC_TIMING_MMC_HS200:
+			/*
+			 * In the case of 150 MHz clock (typical max for
+			 * Rockchip SoCs), 90 degree offset will add a delay
+			 * of 1.67 ns.  That will meet min hold time of .8 ns
+			 * as long as clock output delay is < .87 ns.  On
+			 * SoCs measured this seems to be OK, but it doesn't
+			 * hurt to give margin here, so we use 180.
+			 */
+			phase = 180;
+			break;
+		}
 
-static int inline __dw_mci_rockchip_execute_tuning(struct dw_mci_slot *slot, u32 opcode,
-					u8 *blk_test, unsigned int blksz)
-{
-        struct dw_mci *host = slot->host;
-	struct mmc_host *mmc = slot->mmc;	
-	struct mmc_request mrq = {NULL};
-	struct mmc_command cmd = {0};
-	struct mmc_command stop = {0};
-	struct mmc_data data = {0};
-	struct scatterlist sg;
-
-	cmd.opcode = opcode;
-	cmd.arg = 0;
-	cmd.flags = MMC_RSP_R1 | MMC_CMD_ADTC;
-	stop.opcode = MMC_STOP_TRANSMISSION;
-	stop.arg = 0;
-	stop.flags = MMC_RSP_R1B | MMC_CMD_AC;
-	data.blksz = blksz;
-	data.blocks = 1;
-	data.flags = MMC_DATA_READ;
-	data.sg = &sg;
-	data.sg_len = 1;
-
-	sg_init_one(&sg, blk_test, blksz);
-	mrq.cmd = &cmd;
-	mrq.stop = &stop;
-	mrq.data = &data;
-	host->mrq = &mrq;
-	mci_writel(host, TMOUT, ~0);
-
-	mmc_wait_for_req(mmc, &mrq);
-	if(!cmd.error && !data.error){
-                return 0;
-        }else{
-                dev_dbg(host->dev,
-	                "Tuning error: cmd.error:%d, data.error:%d\n",cmd.error, data.error);
-	        return -EIO;
+		rockchip_mmc_set_phase(host, false, phase);
 	}
-	
 }
 
+#define TUNING_ITERATION_TO_PHASE(i, num_phases) \
+		(DIV_ROUND_UP((i) * 360, num_phases))
 
-static int dw_mci_rockchip_execute_tuning(struct dw_mci_slot *slot, u32 opcode,
-					struct dw_mci_tuning_data *tuning_data)
+static int dw_mci_rk3288_execute_tuning(struct dw_mci_slot *slot, u32 opcode)
 {
-        
 	struct dw_mci *host = slot->host;
-	u8 step;
-	u8 candidates_delayline[MAX_DELAY_LINE] = {0};
-	u8 candidates_degree[SDMMC_SHIFT_DEGREE_INVALID] = {4,4,4,4};
-	u8 default_drv;
-	u8 index = 0;
-	u8 start_degree = 0;
-	u32 start_delayline = 0;
-	const u8 *blk_pattern = tuning_data->blk_pattern;
-	u8 *blk_test;
-	int ret = -1;
-	int ref = 0;
-	unsigned int blksz = tuning_data->blksz;
+	struct dw_mci_rockchip_priv_data *priv = host->priv;
+	struct mmc_host *mmc = slot->mmc;
+	int ret = 0;
+	int i;
+	bool v, prev_v = 0, first_v;
+	struct range_t {
+		int start;
+		int end; /* inclusive */
+	};
+	struct range_t *ranges;
+	unsigned int range_count = 0;
+	int longest_range_len = -1;
+	int longest_range = -1;
+	int middle_phase;
+	int phase;
 
-	MMC_DBG_INFO_FUNC(host->mmc,"execute tuning:  [%s]", mmc_hostname(host->mmc));
+	if (IS_ERR(priv->sample_clk)) {
+		dev_err(host->dev, "Tuning clock (sample_clk) not defined.\n");
+		return -EIO;
+	}
 
-	dw_mci_rockchip_load_tuning_base();
-
-	blk_test = kmalloc(blksz, GFP_KERNEL);
-	if (!blk_test)
-	{
-	        MMC_DBG_ERR_FUNC(host->mmc,"execute tuning:  blk_test kmalloc failed[%s]",
-	                mmc_hostname(host->mmc));
+	ranges = kmalloc_array(priv->num_phases / 2 + 1,
+			       sizeof(*ranges), GFP_KERNEL);
+	if (!ranges)
 		return -ENOMEM;
-        }
-        
-        /* Select use delay line*/
-        dw_mci_rockchip_turning_sel(host, tuning_data->con_id, tuning_data->tuning_type,
-                                    USE_CLK_AFTER_PHASE_AND_DELAY_LINE);
-                                    
-        /* For RK32XX signoff 150M clk, 1 cycle = 6.66ns , and 1/4 phase = 1.66ns. 
-           Netlist level sample LT:  10.531ns / 42.126ps   WC: 19.695ns / 76.936ps.
-           So we take average --- 60ps, (1.66ns/ 2) = 0.83(middle-value),TAKE 0.9
-           0.9 / 60ps = 15 delayline
-         */
-        if (cpu_is_rk3288() && !(rockchip_get_cpu_version() > 0)) {
-                /* RK3288, non-eco */
-                ref = DIV_ROUND_UP(FREQ_REF_150MHZ, host->bus_hz);
-                step = (15 * ref);
 
-                if (step > MAX_DELAY_LINE) {
-                        step = MAX_DELAY_LINE;       
-                        MMC_DBG_WARN_FUNC(host->mmc,
-                                        "execute tuning: TOO LARGE STEP![%s]", mmc_hostname(host->mmc));
-                }
-                MMC_DBG_INFO_FUNC(host->mmc,
-                                "execute tuning: SOC is RK3288, ref = %d, step = %d[%s]",
-                                ref, step, mmc_hostname(host->mmc));
-                 
-        } else {
-                step = (15 * ((FREQ_REF_150MHZ / host->bus_hz) * 100)) / 100;
+	/* Try each phase and extract good ranges */
+	for (i = 0; i < priv->num_phases; ) {
+		rockchip_mmc_set_phase(host, true,
+				       TUNING_ITERATION_TO_PHASE(
+						i,
+						priv->num_phases));
 
-                if (step > MAX_DELAY_LINE) {
-                        step = MAX_DELAY_LINE;
-                        MMC_DBG_WARN_FUNC(host->mmc,
-                                        "execute tuning: TOO LARGE STEP![%s]", mmc_hostname(host->mmc));
-                }
-                MMC_DBG_INFO_FUNC(host->mmc,
-                                "execute tuning: SOC is UNKNOWN, step = %d[%s]",
-                                step, mmc_hostname(host->mmc));
-        }
+		v = !mmc_send_tuning(mmc, opcode, NULL);
 
-re_phase:
-        /* calcute slew rate & drv strength in timing tuning */
-        if(host->mmc->restrict_caps & RESTRICT_CARD_TYPE_SD)
-                default_drv = IO_DRV_4MA;
-        else
-                default_drv = IO_DRV_8MA;
+		if (i == 0)
+			first_v = v;
 
-        dw_mci_rockchip_load_signal_integrity(host, SLEW_RATE_SLOW, default_drv);
-        /* Loop degree from 0 ~ 270 */
-        for(start_degree = SDMMC_SHIFT_DEGREE_0; start_degree < SDMMC_SHIFT_DEGREE_270; start_degree++){
-                dw_mci_rockchip_set_degree(host, tuning_data->con_id, tuning_data->tuning_type, start_degree);
-                if(0 == __dw_mci_rockchip_execute_tuning(slot, opcode, blk_test, blksz)){
-                        if(!memcmp(blk_pattern, blk_test, blksz)){
-                                /* Successfully tuning in this condition*/                      
-                                candidates_degree[index] = start_degree;
-                                index++;
-                         }
-                }
-                /* eMMC spec does not require a delay between tuning cycles
-                 * but eMMC should be guaranteed to complete a sequence of 40 times CMD21
-                 * withnin 150ms, some eMMC may limit 4ms gap between any two sequential CMD21
-                 */
-                if (opcode == MMC_SEND_TUNING_BLOCK)
-                        mdelay(1);
-                else
-                        /* MMC_SEND_TUNING_BLOCK_HS200 */
-                        mdelay(5);
-        }
-        
-        MMC_DBG_BOOT_FUNC(host->mmc,"\n execute tuning: candidates_degree = %s \t%s \t%s \t%s[%s]",
-                phase_desc[candidates_degree[0]], phase_desc[candidates_degree[1]],
-                phase_desc[candidates_degree[2]], phase_desc[candidates_degree[3]],
-                mmc_hostname(host->mmc));
+		if ((!prev_v) && v) {
+			range_count++;
+			ranges[range_count-1].start = i;
+		}
+		if (v) {
+			ranges[range_count-1].end = i;
+			i++;
+		} else if (i == priv->num_phases - 1) {
+			/* No extra skipping rules if we're at the end */
+			i++;
+		} else {
+			/*
+			 * No need to check too close to an invalid
+			 * one since testing bad phases is slow.  Skip
+			 * 20 degrees.
+			 */
+			i += DIV_ROUND_UP(20 * priv->num_phases, 360);
 
-        
-        if((candidates_degree[0] == SDMMC_SHIFT_DEGREE_0)
-                && (candidates_degree[1] == SDMMC_SHIFT_DEGREE_90)
-                && (candidates_degree[2] == SDMMC_SHIFT_DEGREE_180)){
-           
-                MMC_DBG_INFO_FUNC(host->mmc,
-                                "execute tuning: candidates_degree = SDMMC_SHIFT_DEGREE_90 [%s]",
-                                mmc_hostname(host->mmc));
-                                
-                dw_mci_rockchip_set_degree(host, tuning_data->con_id, 
-                        tuning_data->tuning_type, SDMMC_SHIFT_DEGREE_90);
-                ret = 0;
-                goto done;
-        }else if((candidates_degree[0] == SDMMC_SHIFT_DEGREE_90) 
-                && (candidates_degree[1] == SDMMC_SHIFT_DEGREE_180) 
-                && (candidates_degree[2] == SDMMC_SHIFT_DEGREE_270)){
-                MMC_DBG_INFO_FUNC(host->mmc,
-                        "execute tuning: candidates_degree = SDMMC_SHIFT_DEGREE_180 [%s]",
-                        mmc_hostname(host->mmc));
-                dw_mci_rockchip_set_degree(host, tuning_data->con_id, 
-                        tuning_data->tuning_type, SDMMC_SHIFT_DEGREE_180);
-                ret = 0;
-                goto done;
-        }else if((candidates_degree[0] == SDMMC_SHIFT_DEGREE_0) 
-                && (candidates_degree[1] == SDMMC_SHIFT_DEGREE_90) 
-                && (candidates_degree[2] == SDMMC_SHIFT_DEGREE_INVALID)){
+			/* Always test the last one */
+			if (i >= priv->num_phases)
+				i = priv->num_phases - 1;
+		}
 
-                MMC_DBG_INFO_FUNC(host->mmc,
-                        "execute tuning: candidates_degree = SDMMC_SHIFT_DEGREE_0 ~  SDMMC_SHIFT_DEGREE_90[%s]",
-                        mmc_hostname(host->mmc));
-                
-                dw_mci_rockchip_set_degree(host, tuning_data->con_id, tuning_data->tuning_type, SDMMC_SHIFT_DEGREE_0);
-                #if PRECISE_ADJUST
-                goto delayline; 
-                #else              
-                dw_mci_rockchip_set_delaynum(host, tuning_data->con_id, tuning_data->tuning_type, step);
-                ret = 0;
-		goto done;  
-                #endif       
-        }else if((candidates_degree[0]==SDMMC_SHIFT_DEGREE_0) 
-                && (candidates_degree[1]==SDMMC_SHIFT_DEGREE_180)){
+		prev_v = v;
+	}
 
-                MMC_DBG_INFO_FUNC(host->mmc,
-                        "execute tuning: candidates_degree = SDMMC_SHIFT_DEGREE_0 AND SDMMC_SHIFT_DEGREE_180[%s]",
-                        mmc_hostname(host->mmc));
+	if (range_count == 0) {
+		dev_warn(host->dev, "All phases bad!");
+		ret = -EIO;
+		goto free;
+	}
 
-                /* FixMe: NO sense any signal indicator make this case happen*/
-                dw_mci_rockchip_set_degree(host, tuning_data->con_id, tuning_data->tuning_type, SDMMC_SHIFT_DEGREE_0);
-                goto delayline;
-        }else if((candidates_degree[0] == SDMMC_SHIFT_DEGREE_90) 
-                && (candidates_degree[1] == SDMMC_SHIFT_DEGREE_180) 
-                && (candidates_degree[2] == SDMMC_SHIFT_DEGREE_INVALID)){
+	/* wrap around case, merge the end points */
+	if ((range_count > 1) && first_v && v) {
+		ranges[0].start = ranges[range_count-1].start;
+		range_count--;
+	}
 
-                MMC_DBG_INFO_FUNC(host->mmc,
-                        "execute tuning: candidates_degree = SDMMC_SHIFT_DEGREE_90 ~  SDMMC_SHIFT_DEGREE_180[%s]",
-                        mmc_hostname(host->mmc));
-               
-                dw_mci_rockchip_set_degree(host, tuning_data->con_id, tuning_data->tuning_type, SDMMC_SHIFT_DEGREE_90);
-                #if PRECISE_ADJUST
-                goto delayline; 
-                #else              
-                dw_mci_rockchip_set_delaynum(host, tuning_data->con_id, tuning_data->tuning_type, step);
-                ret = 0;
-		goto done;  
-                #endif           	            
-        }else if((candidates_degree[0] == SDMMC_SHIFT_DEGREE_180) 
-                && (candidates_degree[1] == SDMMC_SHIFT_DEGREE_270)){
+	if (ranges[0].start == 0 && ranges[0].end == priv->num_phases - 1) {
+		rockchip_mmc_set_phase(host, true, priv->default_sample_phase);
 
-                MMC_DBG_INFO_FUNC(host->mmc,
-                        "execute tuning: candidates_degree = SDMMC_SHIFT_DEGREE_180 ~  SDMMC_SHIFT_DEGREE_270[%s]",
-                        mmc_hostname(host->mmc));
-              		
-                dw_mci_rockchip_set_degree(host, tuning_data->con_id, tuning_data->tuning_type, SDMMC_SHIFT_DEGREE_180);
-                #if PRECISE_ADJUST
-                goto delayline; 
-                #else              
-                dw_mci_rockchip_set_delaynum(host, tuning_data->con_id, tuning_data->tuning_type, step);
-                ret = 0;
-		goto done;
-                #endif
-        }else if((candidates_degree[0] == SDMMC_SHIFT_DEGREE_180) 
-                && (candidates_degree[1] == SDMMC_SHIFT_DEGREE_INVALID)){
+		dev_info(host->dev, "All phases work, using default phase %d.",
+			 priv->default_sample_phase);
+		goto free;
+	}
 
-                MMC_DBG_INFO_FUNC(host->mmc,
-                        "execute tuning: candidates_degree = [SDMMC_SHIFT_DEGREE_90 + n ~  SDMMC_SHIFT_DEGREE_180][%s]",
-                        mmc_hostname(host->mmc));             
-                
-                dw_mci_rockchip_set_degree(host, tuning_data->con_id, tuning_data->tuning_type, SDMMC_SHIFT_DEGREE_90);
-                #if PRECISE_ADJUST
-                goto delayline;
-                #else
-                default_drv++;
-                goto re_phase;
-                //dw_mci_rockchip_set_delaynum(host, tuning_data->con_id, tuning_data->tuning_type, step);
-                //ret = 0;
-		//goto done;
-                #endif
-        }else if((candidates_degree[0] == SDMMC_SHIFT_DEGREE_90) 
-                && (candidates_degree[1] == SDMMC_SHIFT_DEGREE_INVALID)){
+	/* Find the longest range */
+	for (i = 0; i < range_count; i++) {
+		int len = (ranges[i].end - ranges[i].start + 1);
 
-                MMC_DBG_INFO_FUNC(host->mmc,
-                        "execute tuning: candidates_degree = [SDMMC_SHIFT_DEGREE_0 + n ~  SDMMC_SHIFT_DEGREE_90][%s]",
-                        mmc_hostname(host->mmc));             
-                
-                dw_mci_rockchip_set_degree(host, tuning_data->con_id, tuning_data->tuning_type, SDMMC_SHIFT_DEGREE_0);
-                #if PRECISE_ADJUST
-                goto delayline; 
-                #else
-                default_drv++;
-                goto re_phase;
-                //dw_mci_rockchip_set_delaynum(host, tuning_data->con_id, tuning_data->tuning_type, step);
-                //ret = 0;
-		//goto done;
-                #endif
-        }else if((candidates_degree[0] == SDMMC_SHIFT_DEGREE_270)){
+		if (len < 0)
+			len += priv->num_phases;
 
-                MMC_DBG_INFO_FUNC(host->mmc,
-                        "execute tuning: candidates_degree = SDMMC_SHIFT_DEGREE_270 [%s]",
-                        mmc_hostname(host->mmc));         
+		if (longest_range_len < len) {
+			longest_range_len = len;
+			longest_range = i;
+		}
 
-                /*FixME: so urgly signal indicator, HW engineer help!*/
+		dev_dbg(host->dev, "Good phase range %d-%d (%d len)\n",
+			TUNING_ITERATION_TO_PHASE(ranges[i].start,
+						  priv->num_phases),
+			TUNING_ITERATION_TO_PHASE(ranges[i].end,
+						  priv->num_phases),
+			len
+		);
+	}
 
-                //dw_mci_rockchip_set_degree(host, tuning_data->con_id, tuning_data->tuning_type, SDMMC_SHIFT_DEGREE_180);
-                #if PRECISE_ADJUST
-                goto delayline; 
-                #else
-                default_drv++;
-                goto re_phase;
-                //dw_mci_rockchip_set_delaynum(host, tuning_data->con_id, tuning_data->tuning_type, step);
-                //ret = 0;
-		//goto done;
-                #endif            
-        }else{
-                MMC_DBG_ERR_FUNC(host->mmc,
-                                "execute tuning: candidates_degree beyong limited case! [%s]",
-                                mmc_hostname(host->mmc));
-                default_drv++;
-                goto re_phase;
-                if(host->mmc->restrict_caps & RESTRICT_CARD_TYPE_EMMC)
-                        BUG();
-                return -EAGAIN;
-        }
+	dev_dbg(host->dev, "Best phase range %d-%d (%d len)\n",
+		TUNING_ITERATION_TO_PHASE(ranges[longest_range].start,
+					  priv->num_phases),
+		TUNING_ITERATION_TO_PHASE(ranges[longest_range].end,
+					  priv->num_phases),
+		longest_range_len
+	);
 
-delayline:
-                index = 0;
-                for(start_delayline = 0; start_delayline <= MAX_DELAY_LINE; start_delayline += step){
-                
-                        dw_mci_rockchip_set_delaynum(host, tuning_data->con_id, 
-                                tuning_data->tuning_type, start_delayline);
-                        if(0 == __dw_mci_rockchip_execute_tuning(slot, opcode, blk_test, blksz)){
-                                if(!memcmp(blk_pattern, blk_test, blksz)){
-                                        /* Successfully tuning in this condition*/                                        
-                                        candidates_delayline[index] = start_delayline;
-                                        index++; 
-                                }
-                        }                    
-                }
-                if((index < 2) && (index != 0)) {
-                        /* setup 400ps, consider line loading, at least 600ps wc.
-                           for 150M, 15 steps =900ps ,too larger scale, should step smaller in principle
-                         */
-                        MMC_DBG_INFO_FUNC(host->mmc,
-                                "execute tuning: candidates_delayline failed for no enough elements [%s]",
-                                mmc_hostname(host->mmc));
+	middle_phase = ranges[longest_range].start + longest_range_len / 2;
+	middle_phase %= priv->num_phases;
+	phase = TUNING_ITERATION_TO_PHASE(middle_phase, priv->num_phases);
+	dev_info(host->dev, "Successfully tuned phase to %d\n", phase);
 
-                        /* Make step smaller, and re-calculate */
-                        step = step >> 1;
-                        index = 0;
-                        goto delayline;
-                }else if(index >= 2){
-                        /* Find it! */
-                        MMC_DBG_INFO_FUNC(host->mmc,
-                                "execute tuning: candidates_delayline calculate successfully  [%s]",
-                                mmc_hostname(host->mmc));
+	rockchip_mmc_set_phase(host, true, phase);
 
-                        dw_mci_rockchip_set_delaynum(host, tuning_data->con_id, 
-                                tuning_data->tuning_type, candidates_delayline[index/2]); 
-                        ret = 0; 
-                        goto done;
-                }
-        
-done:
-        kfree(blk_test);
-        blk_test = NULL;
-        return ret;
-        
+free:
+	kfree(ranges);
+	return ret;
 }
 
-/* Common capabilities of RK32XX SoC */
-static unsigned long rockchip_dwmmc_caps[4] = {
-	MMC_CAP_CMD23,
-	MMC_CAP_CMD23,
-	MMC_CAP_CMD23,
-	MMC_CAP_CMD23,
+static int dw_mci_common_parse_dt(struct dw_mci *host)
+{
+	struct device_node *np = host->dev->of_node;
+	struct dw_mci_rockchip_priv_data *priv;
+
+	priv = devm_kzalloc(host->dev, sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+
+	if (of_property_read_u32(np, "rockchip,desired-num-phases",
+				 &priv->num_phases))
+		priv->num_phases = 360;
+
+	if (of_property_read_u32(np, "rockchip,default-sample-phase",
+				 &priv->default_sample_phase))
+		priv->default_sample_phase = 0;
+
+	host->priv = priv;
+
+	return 0;
+}
+
+static int dw_mci_rk3288_parse_dt(struct dw_mci *host)
+{
+	struct dw_mci_rockchip_priv_data *priv;
+	int err;
+
+	err = dw_mci_common_parse_dt(host);
+	if (err)
+		return err;
+
+	priv = host->priv;
+
+	priv->drv_clk = devm_clk_get(host->dev, "ciu-drive");
+	if (IS_ERR(priv->drv_clk))
+		dev_dbg(host->dev, "ciu-drive not available\n");
+
+	priv->sample_clk = devm_clk_get(host->dev, "ciu-sample");
+	if (IS_ERR(priv->sample_clk))
+		dev_dbg(host->dev, "ciu-sample not available\n");
+
+	priv->internal_phase = false;
+
+	return 0;
+}
+
+static int dw_mci_rk3576_parse_dt(struct dw_mci *host)
+{
+	struct dw_mci_rockchip_priv_data *priv;
+	int err = dw_mci_common_parse_dt(host);
+	if (err)
+		return err;
+
+	priv = host->priv;
+
+	priv->internal_phase = true;
+
+	return 0;
+}
+
+static int dw_mci_rockchip_init(struct dw_mci *host)
+{
+	int ret, i;
+
+	/* It is slot 8 on Rockchip SoCs */
+	host->sdio_id0 = 8;
+
+	if (of_device_is_compatible(host->dev->of_node, "rockchip,rk3288-dw-mshc")) {
+		host->bus_hz /= RK3288_CLKGEN_DIV;
+
+		/* clock driver will fail if the clock is less than the lowest source clock
+		 * divided by the internal clock divider. Test for the lowest available
+		 * clock and set the minimum freq to clock / clock divider.
+		 */
+
+		for (i = 0; i < ARRAY_SIZE(freqs); i++) {
+			ret = clk_round_rate(host->ciu_clk, freqs[i] * RK3288_CLKGEN_DIV);
+			if (ret > 0) {
+				host->minimum_speed = ret / RK3288_CLKGEN_DIV;
+				break;
+			}
+		}
+		if (ret < 0)
+			dev_warn(host->dev, "no valid minimum freq: %d\n", ret);
+	}
+
+	return 0;
+}
+
+static const struct dw_mci_drv_data rk2928_drv_data = {
+	.init			= dw_mci_rockchip_init,
 };
 
-unsigned int  rockchip_dwmmc_hold_reg[4] = {1,0,0,0};
+static const struct dw_mci_drv_data rk3288_drv_data = {
+	.common_caps		= MMC_CAP_CMD23,
+	.set_ios		= dw_mci_rk3288_set_ios,
+	.execute_tuning		= dw_mci_rk3288_execute_tuning,
+	.parse_dt		= dw_mci_rk3288_parse_dt,
+	.init			= dw_mci_rockchip_init,
+};
 
-static const struct dw_mci_drv_data rockchip_drv_data = {
-	.caps			= rockchip_dwmmc_caps,
-	.hold_reg_flag  = rockchip_dwmmc_hold_reg,
-	.init			= dw_mci_rockchip_priv_init,
-	.setup_clock		= dw_mci_rockchip_setup_clock,
-	.prepare_command	= dw_mci_rockchip_prepare_command,
-	.set_ios		= dw_mci_rockchip_set_ios,
-	.parse_dt		= dw_mci_rockchip_parse_dt,
-	.execute_tuning		= dw_mci_rockchip_execute_tuning,
+static const struct dw_mci_drv_data rk3576_drv_data = {
+	.common_caps		= MMC_CAP_CMD23,
+	.set_ios		= dw_mci_rk3288_set_ios,
+	.execute_tuning		= dw_mci_rk3288_execute_tuning,
+	.parse_dt		= dw_mci_rk3576_parse_dt,
+	.init			= dw_mci_rockchip_init,
 };
 
 static const struct of_device_id dw_mci_rockchip_match[] = {
-	{ .compatible = "rockchip,rk_mmc",
-			.data = &rockchip_drv_data, },
-	{ /* Sentinel */},
+	{ .compatible = "rockchip,rk2928-dw-mshc",
+		.data = &rk2928_drv_data },
+	{ .compatible = "rockchip,rk3288-dw-mshc",
+		.data = &rk3288_drv_data },
+	{ .compatible = "rockchip,rk3576-dw-mshc",
+		.data = &rk3576_drv_data },
+	{},
 };
 MODULE_DEVICE_TABLE(of, dw_mci_rockchip_match);
 
@@ -639,26 +531,64 @@ static int dw_mci_rockchip_probe(struct platform_device *pdev)
 {
 	const struct dw_mci_drv_data *drv_data;
 	const struct of_device_id *match;
-	
+	int ret;
+
+	if (!pdev->dev.of_node)
+		return -ENODEV;
+
 	match = of_match_node(dw_mci_rockchip_match, pdev->dev.of_node);
 	drv_data = match->data;
-	return dw_mci_pltfm_register(pdev, drv_data);
+
+	pm_runtime_get_noresume(&pdev->dev);
+	pm_runtime_set_active(&pdev->dev);
+	pm_runtime_enable(&pdev->dev);
+	pm_runtime_set_autosuspend_delay(&pdev->dev, 50);
+	pm_runtime_use_autosuspend(&pdev->dev);
+
+	ret = dw_mci_pltfm_register(pdev, drv_data);
+	if (ret) {
+		pm_runtime_disable(&pdev->dev);
+		pm_runtime_set_suspended(&pdev->dev);
+		pm_runtime_put_noidle(&pdev->dev);
+		return ret;
+	}
+
+	pm_runtime_put_autosuspend(&pdev->dev);
+
+	return 0;
 }
+
+static void dw_mci_rockchip_remove(struct platform_device *pdev)
+{
+	pm_runtime_get_sync(&pdev->dev);
+	pm_runtime_disable(&pdev->dev);
+	pm_runtime_put_noidle(&pdev->dev);
+
+	dw_mci_pltfm_remove(pdev);
+}
+
+static const struct dev_pm_ops dw_mci_rockchip_dev_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
+				pm_runtime_force_resume)
+	SET_RUNTIME_PM_OPS(dw_mci_runtime_suspend,
+			   dw_mci_runtime_resume,
+			   NULL)
+};
 
 static struct platform_driver dw_mci_rockchip_pltfm_driver = {
 	.probe		= dw_mci_rockchip_probe,
-	.remove		= __exit_p(dw_mci_pltfm_remove),
+	.remove		= dw_mci_rockchip_remove,
 	.driver		= {
 		.name		= "dwmmc_rockchip",
+		.probe_type	= PROBE_PREFER_ASYNCHRONOUS,
 		.of_match_table	= dw_mci_rockchip_match,
-		.pm		= &dw_mci_pltfm_pmops,
+		.pm		= &dw_mci_rockchip_dev_pm_ops,
 	},
 };
 
 module_platform_driver(dw_mci_rockchip_pltfm_driver);
 
-MODULE_DESCRIPTION("Rockchip Specific DW-SDMMC Driver Extension");
-MODULE_AUTHOR("Shawn Lin <lintao@rock-chips.com>");
-MODULE_AUTHOR("Bangwang Xie <xbw@rock-chips.com>");
+MODULE_AUTHOR("Addy Ke <addy.ke@rock-chips.com>");
+MODULE_DESCRIPTION("Rockchip Specific DW-MSHC Driver Extension");
+MODULE_ALIAS("platform:dwmmc_rockchip");
 MODULE_LICENSE("GPL v2");
-MODULE_ALIAS("platform:dwmmc-rockchip");

@@ -5,10 +5,11 @@
 #include <dt-bindings/rkfb/rk_fb.h>
 
 #include "skeleton.dtsi"
+#include "rk818.dtsi"
 #include "rk312x-clocks.dtsi"
 #include "rk312x-pinctrl.dtsi"
 
-/ {
+/  {
 	compatible = "rockchip,rk312x";
 	rockchip,sram = <&sram>;
 	interrupt-parent = <&gic>;
@@ -33,21 +34,28 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a7";
 			reg = <0xf00>;
+			clocks = <0x03 0x05>;
+			cpu-supply = <0x04>;
+			dynamic-power-coefficient = <0x78>;
+			operating-points-v2 = <0x02>;
 		};
 		cpu@1 {
 			device_type = "cpu";
 			compatible = "arm,cortex-a7";
 			reg = <0xf01>;
+			operating-points-v2 = <0x02>;
 		};
 		cpu@2 {
 			device_type = "cpu";
 			compatible = "arm,cortex-a7";
 			reg = <0xf02>;
+			operating-points-v2 = <0x02>;
 		};
 		cpu@3 {
 			device_type = "cpu";
 			compatible = "arm,cortex-a7";
 			reg = <0xf03>;
+			operating-points-v2 = <0x02>;
 		};
 	};
 
@@ -172,6 +180,7 @@
 			interrupts = <GIC_SPI 0 IRQ_TYPE_LEVEL_HIGH>,
 				     <GIC_SPI 1 IRQ_TYPE_LEVEL_HIGH>;
 			#dma-cells = <1>;
+			peripherals-req-type-burst;
 		};
 	};
 
@@ -331,6 +340,18 @@
 			          "Mali_PP0_MMU_IRQ",
 			          "Mali_PP1_IRQ",
 			          "Mali_PP1_MMU_IRQ";
+		mali-supply = <0x12>;
+		clock-names = "clk_mali";
+		clocks = <0x03 0xd5>;
+		power_model {
+			compatible = "arm,mali-simple-power-model";
+			dynamic-power = <0x18c>;
+			frequency = <0x1f4>;
+			static-power = <0x12c>;
+			thermal-zone = "soc-thermal";
+			ts = <0x7d00 0x125c 0xffffffb0 0x02>;
+			voltage = <0x384>;
+		};
 	  };
 
 	clocks-enable {
@@ -519,6 +540,9 @@
 		interrupts = <GIC_SPI 19 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&clk_gates2 15>, <&clk_gates5 0>, <&clk_gates9 6>, <&clk_gates9 5>, <&pd_mipidsi>;
 		clock-names = "clk_mipi_24m", "pclk_mipi_dsi", "pclk_mipi_dsi_host", "hclk_vio_h2p", "pd_mipi_dsi";
+		power-domains = <0x16 0x01>;
+		phy-names = "mipi_dphy";
+		phys = <0x29>;
 		status = "okay";
 	};
 
@@ -540,7 +564,7 @@
         };
 
 
-        sdmmc: rksdmmc@10214000 {
+    sdmmc: rksdmmc@10214000 {
 		compatible = "rockchip,rk_mmc", "rockchip,rk312x-sdmmc";
 		reg = <0x10214000 0x4000>;
 		interrupts = <GIC_SPI 14 IRQ_TYPE_LEVEL_HIGH>;
@@ -557,6 +581,19 @@
 		num-slots = <1>;
 		fifo-depth = <0x100>;
 		bus-width = <4>;
+		cd-gpios = <0x58 0x11 0x0>;
+		clock-frequency = <37500000>;
+		clock-freq-min-max = <300000 208000000>;
+		supports-UHS_SDR104;
+		supports-highspeed;
+		supports-sd;
+		broken-cd;
+		ignore-pm-notify;
+		keep-power-in-suspend;
+		card-detect-delay = <200>;
+		vmmc-supply = <&rk818_ldo9_reg>;
+		bus-width = <0x04>;
+		status = "okay";
 	};
 
 	sdio: rksdmmc@10218000 {
@@ -575,6 +612,10 @@
 		num-slots = <1>;
 		fifo-depth = <0x100>;
 		bus-width = <4>;
+		card-detect-delay = <0xc8>;
+		clock-freq-min-max = <0x61a80 0x23c3460>;
+		clock-frequency = <0x23c3460>;
+		ignore-pm-notify;
 	};
 	
 	spi0: spi@20074000 {
@@ -608,6 +649,7 @@
 		clocks = <&clk_saradc>, <&clk_gates7 14>;
 		clock-names = "saradc", "pclk_saradc";
 		status = "disabled";
+		
 	};
 
 	pwm0: pwm@20050000 {
@@ -705,6 +747,11 @@
 		reset-names = "otg_ahb", "otg_phy", "otg_controller";
 		/*0 - Normal, 1 - Force Host, 2 - Force Device*/
 		rockchip,usb-mode = <0>;
+		dr_mode = "otg";
+		g-np-tx-fifo-size = <0x10>;
+		g-rx-fifo-size = <0x118>;
+		g-tx-fifo-size = <0x100 0x80 0x80 0x40 0x20 0x10>;
+		g-use-dma;
 	};
 
 	ehci: usb@101c0000 {
@@ -791,14 +838,19 @@
 		reg = <0x10104000 0x400>;
 		interrupts = <GIC_SPI 66 IRQ_TYPE_LEVEL_HIGH>;
 		interrupt-names = "irq_dec";
+		power-domains = <0x16 0x02>;
 		dev_mode = <1>;
 		name = "hevc_service";
+		status = "okay";
 	};
 
 	vpu_combo: vpu_combo@ff9a0000 {
 		compatible = "rockchip,vpu_combo";
 		subcnt = <2>;
 		rockchip,sub = <&vpu>, <&hevc>;
+		rockchip,grf = <0x0b>;
+		reset-names = "video_h\0video_a\0video";
+		resets = <0x03 0x71 0x03 0x70 0x03 0x73>;
 		clocks = <&clk_vdpu>, <&hclk_vdpu>, <&clk_hevc_core>;
 		clock-names = "aclk_vcodec", "hclk_vcodec", "clk_core";
 		mode_bit = <15>;
@@ -823,6 +875,7 @@
 		interrupts = <GIC_SPI 44 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&clk_gates6 10>, <&clk_gates6 11>;
 		clock-names = "hclk_rga", "aclk_rga";
+		dma-coherent;
 		status = "okay";
 	};
 
@@ -841,6 +894,8 @@
 		      <0x10104480 0x40>;
 		interrupts = <GIC_SPI 65 IRQ_TYPE_LEVEL_HIGH>;
 		interrupt-names = "hevc_mmu";
+		power-domains = <0x16 0x02>;
+		status = "okay";
 	  };
 
 	  vpu_mmu {
@@ -849,6 +904,7 @@
 		reg = <0x10106800 0x100>;
 		interrupts = <GIC_SPI 67 IRQ_TYPE_LEVEL_HIGH>;
 		interrupt-names = "vpu_mmu";
+		status = "okay";
 	  };
 
 	  iep_mmu {
@@ -958,7 +1014,15 @@
 	     interrupts = <GIC_SPI 8 IRQ_TYPE_LEVEL_HIGH>;
 	     clocks = <&pd_vip>,<&clk_gates6 5>,<&clk_gates6 4>,<&clk_cif0_in>,<&clk_cif_out>;
 	     clock-names = "pd_cif0", "aclk_cif0","hclk_cif0","cif0_in","cif0_out";
-	     status = "okay";
+	    port {
+			endpoint {
+				hsync-active = <0x01>;
+				remote-endpoint = <0x24>;
+				vsync-active = <0x00>;
+			};
+		};
+		 
+		 status = "okay";
 	     };
 
 	codec_hdmi_spdif: codec-hdmi-spdif {
@@ -980,9 +1044,23 @@
 		//pinctrl-names = "default";
 		//pinctrl-0 = <&i2s_gpio>;
 		boot_depop = <1>;
-		pa_enable_time = <1000>;
+		//pa_enable_time = <1000>;
 		clocks = <&clk_gates5 14>;
 		clock-names = "g_pclk_acodec";
+		capture_volume = <0x1a>;
+		codec_hp_det = <0x01>;
+		//hp-mute-delay = <0x64>;
+		hp_volume = <0x19>;
+		interrupts = <0x00 0x40 0x04>;
+		is_rk3128 = <0x01>;
+		pa_enable_time = <0x3e8>;
+		rk312x_for_mid = <0x01>;
+		rockchip,grf = <0x0b>;
+		spk-ctl-gpios = <0x34 0x03 0x00>;
+		spk-mute-delay = <0xc8>;
+		spk_volume = <0x19>;
+		hp-mute-delay = <0x64>;
+		status = "okay";
 	};
 	rockchip_audio: audio-rk312x {
 		compatible = "audio-rk312x";

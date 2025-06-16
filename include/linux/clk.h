@@ -18,7 +18,14 @@
 
 struct device;
 
-struct clk;
+struct clk {
+	struct udevice *dev;
+	/*
+	 * Written by of_xlate. We assume a single id is enough for now. In the
+	 * future, we might add more fields here.
+	 */
+	unsigned long id;
+};
 
 #ifdef CONFIG_COMMON_CLK
 
@@ -240,7 +247,33 @@ long clk_round_rate(struct clk *clk, unsigned long rate);
  * Returns success (0) or negative errno.
  */
 int clk_set_rate(struct clk *clk, unsigned long rate);
+/**
+ * clk_get_phase() - Get the phase shift of a clock signal.
+ *
+ * @clk:	A clock struct that was previously successfully requested by
+ *		clk_request/get_by_*().
+ * @return the phase shift of a clock node in degrees, otherwise returns
+ *		-ve error code.
+ */
+int clk_get_phase(struct clk *clk);
 
+/**
+ * clk_set_rate() - Adjust the phase shift of a clock signal.
+ *
+ * @clk:	A clock struct that was previously successfully requested by
+ *		clk_request/get_by_*().
+ * @degrees:	Numberof degrees the signal is shifted.
+ * @return 0 on success, or -ve error code.
+ */
+int clk_set_phase(struct clk *clk, int degrees);
+
+/**
+ * clk_enable() - Enable (turn on) a clock.
+ *
+ * @clk:	A clock struct that was previously successfully requested by
+ *		clk_request/get_by_*().
+ * @return zero on success, or -ve error code.
+ */
 /**
  * clk_set_parent - set the parent clock source for this clock
  * @clk: clock source

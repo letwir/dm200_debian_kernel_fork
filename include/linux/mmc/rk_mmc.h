@@ -180,6 +180,7 @@ struct dw_mci {
 	struct dw_mci_board	*pdata;
 	const struct dw_mci_drv_data	*drv_data;
 	void			*priv;
+	struct clk	*hpclk_mmc;
 	struct clk      *hclk_mmc;
 	struct clk      *clk_mmc;
 	struct dw_mci_slot	*slot[MAX_MCI_SLOTS];
@@ -205,6 +206,7 @@ struct dw_mci {
 	bool	    irq_state;
 	u32                     svi_flags; /* Switch voltage interrupt flags */
 	struct regulator	*vmmc;	/* Power regulator */
+	struct regulator	*vmmcq;
 	unsigned long		irq_flags; /* IRQ flags */
 	int			irq;
 	u32         cmd_rto;     /* Cmd response timeout hold times */
@@ -215,10 +217,14 @@ struct dw_mci {
 	struct pinctrl_state	*pins_idle;    /* Gpio port */
 	struct pinctrl_state    *pins_udbg;    /* uart_dbg port */
 
-	u32	cid;
+
 	struct regmap	*grf;
 	u32 *regs_buffer;
 	const struct dw_mci_rst_ops *rst_ops;
+	u32	tune_regsbase;
+	struct reset_control *reset;
+	bool power_inverted;
+
 #ifdef CONFIG_PM_WARP
 	struct {
 		u32 ctrl;
@@ -316,7 +322,7 @@ struct dw_mci_board {
 	struct block_settings *blk_settings;
 };
 #define grf_writel(v, offset)   do \
-        { writel_relaxed(v, RK_GRF_VIRT + offset); dsb(); } \
+		{ writel_relaxed(v, RK_GRF_VIRT + offset); dsb(sy); } \
                 while (0)
 
 #endif /* LINUX_MMC_DW_MMC_H */

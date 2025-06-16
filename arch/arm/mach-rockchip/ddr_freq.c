@@ -31,6 +31,13 @@
 #include <linux/rockchip/cpu.h>
 #include "../../../drivers/clk/rockchip/clk-pd.h"
 #include "cpu_axi.h"
+#include <notifier.h>
+#include <sys/types.h>
+#include <stat.h>
+#include <basic_types.h>
+#include <int-l64.h>
+#include <types.h>
+#include <gfp.h>
 
 static DECLARE_COMPLETION(ddrfreq_completion);
 static DEFINE_MUTEX(ddrfreq_mutex);
@@ -92,6 +99,9 @@ struct bpvopinfo {
 };
 
 struct ddr {
+	#ifdef CONFIG_HAS_EARLYSUSPEND
+		struct early_suspend early_suspend;
+	#endif
 	struct dvfs_node *clk_dvfs_node;
 	struct list_head video_info_list;
 	unsigned long normal_rate;
@@ -117,7 +127,11 @@ static struct ddr ddr;
 module_param_named(sys_status, ddr.sys_status, ulong, S_IRUGO);
 module_param_named(auto_self_refresh, ddr.auto_self_refresh, bool, S_IRUGO);
 module_param_named(mode, ddr.mode, charp, S_IRUGO);
-
+static noinline void ddrfreq_set_sys_status(int status)
+{
+	ddr.sys_status |= status;
+	wake_up(&ddr.wait);
+}
 static unsigned long auto_freq_round(unsigned long freq)
 {
 	int i;
@@ -133,7 +147,7 @@ static unsigned long auto_freq_round(unsigned long freq)
 
 	return auto_freq_table[i-1];
 }
-
+static noinline void ddrfreq_clear_sys_status(int status)
 static unsigned long auto_freq_get_index(unsigned long freq)
 {
 	int i;
@@ -150,11 +164,15 @@ static unsigned long auto_freq_get_index(unsigned long freq)
 }
 
 static unsigned int auto_freq_update_index(unsigned long freq)
-{
+{	
+	ddr.sys_status &= ~status;
+	wake_up(&ddr.wait);
+
 	cur_freq_index = auto_freq_get_index(freq);
 
 	return cur_freq_index;
 }
+int ddr_set_rate(uint32_t nMHz);
 
 
 static unsigned long auto_freq_get_next_step(void)
@@ -166,7 +184,7 @@ static unsigned long auto_freq_get_next_step(void)
 	return auto_freq_table[cur_freq_index];
 }
 
-static void ddrfreq_mode(bool auto_self_refresh, unsigned long target_rate, char *name)
+static void ddrfreq_mode(bool auto_self_refresh, unsigned long *target_rate, char *name)
 {
 	unsigned int min_rate, max_rate;
 	int freq_limit_en;
@@ -182,8 +200,8 @@ static void ddrfreq_mode(bool auto_self_refresh, unsigned long target_rate, char
 		freq_limit_en = dvfs_clk_get_limit(clk_cpu_dvfs_node, &min_rate, &max_rate);
 
 		dvfs_clk_enable_limit(clk_cpu_dvfs_node, 600000000, -1);
-		if (dvfs_clk_set_rate(ddr.clk_dvfs_node, target_rate) == 0) {
-			target_rate = dvfs_clk_get_rate(ddr.clk_dvfs_node);
+		if (dvfs_clk_set_rate(ddr.clk_dvfs_node, *target_rate) == 0) {
+			*target_rate = dvfs_clk_get_rate(ddr.clk_dvfs_node);
 			auto_freq_update_index(target_rate);
 			dprintk(DEBUG_DDR, "change freq to %lu MHz when %s\n", target_rate / MHZ, name);
 		}
@@ -291,6 +309,12 @@ static noinline long ddrfreq_work(unsigned long sys_status)
 	long timeout = MAX_SCHEDULE_TIMEOUT;
 	unsigned long target_rate = 0;
 	unsigned long s = sys_status;
+	
+	if (!cpu)
+		cpu = clk_get(NULL, "cpu");
+	if (!gpu)
+		gpu = clk_get(NULL, "gpu");
+
 	bool auto_self_refresh = false;
 	char *mode = NULL;
 
@@ -351,7 +375,13 @@ static noinline long ddrfreq_work(unsigned long sys_status)
 			mode = "video_1080p";
 		}
 	}
-
+	if (ddr.video_720p_rate && (s & SYS_STATUS_VIDEO_1080P)) {
+		if (ddr.video_720p_rate > target_rate) {
+			target_rate = ddr.video_1080p_rate;
+			auto_self_refresh = false;
+			mode = "video_720p";
+		}
+	}
 	if (ddr.isp_rate && (s & SYS_STATUS_ISP)) {
 		if (ddr.isp_rate > target_rate) {
 			target_rate = ddr.isp_rate;
@@ -384,6 +414,8 @@ static noinline long ddrfreq_work(unsigned long sys_status)
 	} else if (ddr.dualview_rate && 
 		(s & SYS_STATUS_LCDC0) && (s & SYS_STATUS_LCDC1)) {
 		ddrfreq_mode(false, &ddr.dualview_rate, "dual-view");
+	} else if (ddr.video_720p_rate && (s & SYS_STATUS_VIDEO_720P)) {
+		ddrfreq_mode(false, &ddr.video_720p_rate, "video_720p");
 	} else if (ddr.video_1080p_rate && (s & SYS_STATUS_VIDEO_1080P)) {
 		ddrfreq_mode(false, &ddr.video_1080p_rate, "video_1080p");
 	} else if (ddr.video_4k_rate && (s & SYS_STATUS_VIDEO_4K)) {
@@ -441,7 +473,9 @@ static int ddrfreq_task(void *data)
 
 	return 0;
 }
-
+#ifdef CONFIG_HAS_EARLYSUSPEND
+static void ddrfreq_early_suspend(struct early_suspend *h)
+#endif
 void add_video_info(struct video_info *video_info)
 {
 	if (video_info)
@@ -525,7 +559,7 @@ static long get_video_param(char **str)
 
 	return 0;
 }
-
+#define VIDEO_LOW_RESOLUTION       (1080*720)
 static ssize_t video_state_write(struct file *file, const char __user *buffer,
 				 size_t count, loff_t *ppos)
 {
@@ -731,7 +765,7 @@ static struct input_handler ddr_freq_input_handler = {
 	.id_table	= ddr_freq_ids,
 };
 #endif
-#if 0
+
 static int ddrfreq_clk_event(int status, unsigned long event)
 {
 	switch (event) {
@@ -769,7 +803,6 @@ do { \
 CLK_NOTIFIER(pd_isp, ISP)
 CLK_NOTIFIER(pd_vop0, LCDC0)
 CLK_NOTIFIER(pd_vop1, LCDC1)
-#endif
 
 static int ddr_freq_suspend_notifier_call(struct notifier_block *self,
 				unsigned long action, void *data)
@@ -873,6 +906,8 @@ int of_init_ddr_freq_table(void)
 			ddr.normal_rate = rate;
 		if (status & SYS_STATUS_SUSPEND)
 			ddr.suspend_rate = rate;
+		if ((status & SYS_STATUS_VIDEO_720P)
+			ddr.video_rate = rate;
 		if (status & SYS_STATUS_VIDEO_1080P)
 			ddr.video_1080p_rate = rate;
 		if (status & SYS_STATUS_VIDEO_4K)

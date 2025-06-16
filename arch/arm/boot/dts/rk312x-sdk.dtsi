@@ -84,6 +84,7 @@
 &sdmmc {
 	clock-frequency = <37500000>;
 	clock-freq-min-max = <400000 37500000>;
+	supports-UHS_SDR104;
 	supports-highspeed;
 	supports-sd;
 	broken-cd;
